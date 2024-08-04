@@ -1,0 +1,403 @@
+#include <DHT.h>
+#include <Arduino.h>
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+#include <ESP_Mail_Client.h>
+#include <ESP8266HTTPClient.h>
+
+
+#define DHTPIN            0           //D3    
+#define DHTTYPE           DHT11       //DHT 11
+#define BUZZER            4           //D2
+#define WATER_FLOAT       5           //D1 
+
+
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT 465
+
+/* The sign in credentials */
+#define AUTHOR_EMAIL "smartagri2024@gmail.com"
+#define AUTHOR_PASSWORD "vagbpnnthmwwscin"
+
+/* Recipient's email*/
+#define RECIPIENT_EMAIL "Sanjanakulkarni1995@gmail.com"
+
+/* The SMTP Session object used for Email sending */
+SMTPSession smtp;
+
+static int CNT=0;
+
+void smtpCallback(SMTP_Status status);
+
+const int channelID = 2393731;
+String apiKey = "HKDRT1ROAHCYAX4Q";     //  Enter your Write API key from ThingSpeak
+const char *ssid =  "Narasimha";     // replace with your wifi ssid and wpa2 key
+const char *pass =  "ssjnk@106";
+const char* server = "api.thingspeak.com";
+
+unsigned long lastConnectionTime = 0; 
+const unsigned long postingInterval = 15L * 1000L; // Post data every 15 seconds.
+const int checkTalkBackInterval = 2 * 1000;    // Time interval in milliseconds to check TalkBack (number of seconds * 1000 = interval)
+float t,h;
+float voltage;
+int float_stat;
+
+const int voltagePin = A0;                        // Analog input pin for the voltage sensor
+const int relayPin = 16;                          // Digital pin D0 connected to the relay module
+const float low_threshold_Voltage = 2.0;          // Set your threshold low voltage level here
+const float high_threshold_Voltage = 4.0;         // Set your threshold high voltage level here
+
+
+WiFiClient client;               // Initialize the Wifi client library.
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup()
+{
+  Serial.begin(9600);
+  pinMode(voltagePin, INPUT);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);         // Initialize relay to an open state
+  
+  pinMode(BUZZER,OUTPUT);
+  pinMode(WATER_FLOAT,INPUT_PULLUP);
+  digitalWrite(BUZZER,LOW);
+
+  dht.begin();
+  
+  Serial.println("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+}
+
+
+void loop()
+{  
+  static int talkback_stat=0;
+  voltage = analogRead(voltagePin) * (5.0 / 1023.0);  // Read and convert analog input to voltage
+  Serial.print(analogRead(voltagePin));
+  Serial.print("\nVoltage: ");
+  Serial.println(voltage);
+  
+  t = dht.readTemperature();
+  h = dht.readHumidity();
+  float_stat=digitalRead(WATER_FLOAT);
+  
+  Serial.print("\nTemperature:");
+  Serial.print(t);
+  Serial.print("\tHumidity:");
+  Serial.print(h);
+  Serial.print("\nWater float:");
+  Serial.print(float_stat);
+  
+  talkback_stat=check_water_pump_Control();
+  if(talkback_stat==1)
+  {
+    digitalWrite(relayPin, HIGH);
+  }
+  else if(talkback_stat==0)
+  {
+    digitalWrite(relayPin, LOW);
+  }
+  if (voltage < low_threshold_Voltage || voltage > high_threshold_Voltage)
+  {
+    digitalWrite(relayPin, LOW);               // Turn off the circuit by activating the relay    
+    digitalWrite(BUZZER, HIGH);
+    delay(1000);
+    digitalWrite(BUZZER, LOW); 
+    send_Vtg_Alert_mail();   
+  } 
+  if(float_stat==1)
+  {
+    Serial.print("\nWater Level is Low in tank");
+    digitalWrite(relayPin, LOW); 
+    digitalWrite(BUZZER, HIGH);
+    delay(1000);
+    digitalWrite(BUZZER, LOW); 
+    send_Water_level_Alert_mail();  
+  }
+  if(t>32 && t<45)
+  {
+    Serial.print("\nWinding Temperature is high");
+    digitalWrite(relayPin, LOW); 
+    digitalWrite(BUZZER, HIGH);
+    delay(1000);
+    digitalWrite(BUZZER, LOW); 
+    send_Temp_Alert_mail(); 
+  }
+  send_data();
+  delay(500);
+}
+
+
+void send_data()
+{
+  if (client.connect(server,80))   //   "184.106.153.149" or api.thingspeak.com
+  {            
+     String postStr = apiKey;             
+     postStr +="&field1=";
+     postStr += String(t);
+     postStr +="&field2=";
+     postStr += String(h); 
+     postStr +="&field3=";
+     postStr += String(float_stat);            
+     postStr += "\r\n\r\n";
+     client.print("POST /update HTTP/1.1\n");
+     client.print("Host: api.thingspeak.com\n");
+     client.print("Connection: close\n");
+     client.print("X-THINGSPEAKAPIKEY: "+apiKey+"\n");
+     client.print("Content-Type: application/x-www-form-urlencoded\n");
+     client.print("Content-Length: ");
+     client.print(postStr.length());
+     client.print("\n\n");
+     client.print(postStr);
+     delay(postingInterval);
+  }
+}
+
+
+/* Callback function to get the Email sending status */
+void smtpCallback(SMTP_Status status)
+{
+  /* Print the current status */
+  Serial.println(status.info());
+  /* Print the sending result */
+  if (status.success())
+  {
+    //Serial.println("----------------");
+    ESP_MAIL_PRINTF("Message sent success: %d\n", status.completedCount());
+    ESP_MAIL_PRINTF("Message sent failled: %d\n", status.failedCount());
+    Serial.println("----------------\n");
+    struct tm dt;
+
+    for (size_t i = 0; i < smtp.sendingResult.size(); i++)
+    {
+      /* Get the result item */
+      SMTP_Result result = smtp.sendingResult.getItem(i);
+      time_t ts = (time_t)result.timestamp;
+      localtime_r(&ts, &dt);
+
+      ESP_MAIL_PRINTF("Message No: %d\n", i + 1);
+      ESP_MAIL_PRINTF("Status: %s\n", result.completed ? "success" : "failed");
+     // ESP_MAIL_PRINTF("Date/Time: %d/%d/%d %d:%d:%d\n", dt.tm_year + 1953, dt.tm_mon + 4, dt.tm_mday+3, dt.tm_hour, dt.tm_min, dt.tm_sec);
+      ESP_MAIL_PRINTF("Recipient: %s\n", result.recipients.c_str());
+      ESP_MAIL_PRINTF("Subject: %s\n", result.subject.c_str());
+    }
+    Serial.println("----------------\n");
+  }
+}
+
+
+
+void send_Water_level_Alert_mail()
+{
+    /** Enable the debug via Serial port
+   * none debug or 0
+   * basic debug or 1
+  */
+  smtp.debug(1);
+  /* Set the callback function to get the sending results */
+  smtp.callback(smtpCallback);
+  /* Declare the session config data */
+  ESP_Mail_Session session;
+  /* Set the session config */
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = AUTHOR_EMAIL;
+  session.login.password = AUTHOR_PASSWORD;
+  session.login.user_domain = "";
+  /* Declare the message class */
+  SMTP_Message message;
+  /* Set the message headers */
+  message.sender.name = "Alert Mail";
+  message.sender.email = AUTHOR_EMAIL;
+  message.subject = "Tank Water Level Alert";
+  message.addRecipient("Client", RECIPIENT_EMAIL);
+
+  /*Send HTML message*/
+  //String htmlMsg = "<div style=\"color:#2f4468;\"><h1>Temperature crossed threshold</h1></div>"+String("Temperature:")+String(t)+String("°C")+String("<p>Humidity:")+String(h)+String("%")+String("<p>- Sent from ESP8266 board</p>");
+  String htmlMsg = "<div style=\"color:pink;\"><h1>Water level is Low</h1></div>"+String("<p>- Sent from ESP8266 board</p>");
+  message.html.content = htmlMsg.c_str();
+  message.html.content = htmlMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  /*
+  //Send raw text message
+  String textMsg = "Hello World! - Sent from ESP8266 board";
+  message.text.content = textMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+  
+  message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
+  message.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure | esp_mail_smtp_notify_delay;*/
+  /* Set the custom message header */
+  //message.addHeader("Message-ID: <abcde.fghij@gmail.com>");
+  /* Connect to server with the session config */
+  if (!smtp.connect(&session))
+    return;
+  /* Start sending Email and close the session */
+  if (!MailClient.sendMail(&smtp, &message))
+    Serial.println("Error sending Email, " + smtp.errorReason());
+
+}
+
+
+void send_Temp_Alert_mail()
+{
+    /** Enable the debug via Serial port
+   * none debug or 0
+   * basic debug or 1
+  */
+  smtp.debug(1);
+  /* Set the callback function to get the sending results */
+  smtp.callback(smtpCallback);
+  /* Declare the session config data */
+  ESP_Mail_Session session;
+  /* Set the session config */
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = AUTHOR_EMAIL;
+  session.login.password = AUTHOR_PASSWORD;
+  session.login.user_domain = "";
+  /* Declare the message class */
+  SMTP_Message message;
+  /* Set the message headers */
+  message.sender.name = "Temperature Alert Mail";
+  message.sender.email = AUTHOR_EMAIL;
+  message.subject = "Winding Temperature is high";
+  message.addRecipient("Client", RECIPIENT_EMAIL);
+
+  /*Send HTML message*/
+  String htmlMsg = "<div style=\"color:pink;\"><h1>Temperature crossed threshold</h1></div>"+String("Temperature:")+String(t)+String("°C")+String("<p>Humidity:")+String(h)+String("%")+String("<p>- Sent from ESP8266 board</p>");
+  message.html.content = htmlMsg.c_str();
+  message.html.content = htmlMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  /*
+  //Send raw text message
+  String textMsg = "Hello World! - Sent from ESP8266 board";
+  message.text.content = textMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+  
+  message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
+  message.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure | esp_mail_smtp_notify_delay;*/
+  /* Set the custom message header */
+  //message.addHeader("Message-ID: <abcde.fghij@gmail.com>");
+  /* Connect to server with the session config */
+  if (!smtp.connect(&session))
+    return;
+  /* Start sending Email and close the session */
+  if (!MailClient.sendMail(&smtp, &message))
+    Serial.println("Error sending Email, " + smtp.errorReason());
+
+}
+
+void send_Vtg_Alert_mail()
+{
+    /** Enable the debug via Serial port
+   * none debug or 0
+   * basic debug or 1
+  */
+  smtp.debug(1);
+  /* Set the callback function to get the sending results */
+  smtp.callback(smtpCallback);
+  /* Declare the session config data */
+  ESP_Mail_Session session;
+  /* Set the session config */
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = AUTHOR_EMAIL;
+  session.login.password = AUTHOR_PASSWORD;
+  session.login.user_domain = "";
+  /* Declare the message class */
+  SMTP_Message message;
+  /* Set the message headers */
+  message.sender.name = "Voltage Alert Mail";
+  message.sender.email = AUTHOR_EMAIL;
+  message.subject = "Voltage fluctuating";
+  message.addRecipient("Client", RECIPIENT_EMAIL);
+
+  /*Send HTML message*/
+  String htmlMsg = "<div style=\"color:Black;\"><h1>Voltage is fluctuating</h1></div>"+String("Voltage:")+String(voltage)+String("<p>- Sent from ESP8266 board</p>");
+  
+  message.html.content = htmlMsg.c_str();
+  message.html.content = htmlMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  /*
+  //Send raw text message
+  String textMsg = "Hello World! - Sent from ESP8266 board";
+  message.text.content = textMsg.c_str();
+  message.text.charSet = "us-ascii";
+  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+  
+  message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
+  message.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure | esp_mail_smtp_notify_delay;*/
+  /* Set the custom message header */
+  //message.addHeader("Message-ID: <abcde.fghij@gmail.com>");
+  /* Connect to server with the session config */
+  if (!smtp.connect(&session))
+    return;
+  /* Start sending Email and close the session */
+  if (!MailClient.sendMail(&smtp, &message))
+    Serial.println("Error sending Email, " + smtp.errorReason());
+
+}
+
+
+int check_water_pump_Control()
+{
+  int stat;
+  String talkBackAPIKey = "KMGEHQOEKWP3XZG4";  // Buzzer Control TalkBack API key
+  String talkBackID = "50997";                 // Buzzer control TalkBack ID
+
+  HTTPClient http; 
+  String thingSpeakAPI = "api.thingspeak.com";
+  char charIn;
+  String talkBackURL =  "http://" + thingSpeakAPI + "/talkbacks/" + talkBackID + "/commands/execute?api_key=" + talkBackAPIKey;
+  
+  // Make a HTTP GET request to the TalkBack API:
+  http.begin(client,talkBackURL); 
+  int httpCode = http.GET(); 
+  
+  if (httpCode > 0) 
+  { 
+      String talkBackCommand = http.getString();   //Get the request response payload
+      //Serial.print("\nTalkBackCommand=");
+      Serial.print(talkBackCommand.c_str());     //Print the response payload
+
+      http.end();   //Close connection
+  
+      if (!strcmp(talkBackCommand.c_str(), "TURN_ON")) 
+      {  
+          //digitalWrite(LED_BUILTIN, LOW);
+          stat= 1;
+      }
+      else if (!strcmp(talkBackCommand.c_str(), "TURN_OFF")) 
+      {    
+          //digitalWrite(LED_BUILTIN, HIGH);
+          stat= 0;
+      }
+      else
+      {
+        Serial.print("");
+      }
+      Serial.flush(); 
+      delay(1000);
+  }
+  return stat;
+}
+
